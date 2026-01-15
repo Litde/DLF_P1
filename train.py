@@ -7,22 +7,51 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import torch.cuda.amp as amp
 
-from transformers import BertModel
-from transformers import ViTModel
+from transformers import BertModel, ViTModel
 from transformers import BertTokenizer, ViTImageProcessor
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+
+# sklearn is only needed for evaluation metrics during training.
+try:
+    from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+except Exception:  # pragma: no cover
+    accuracy_score = f1_score = roc_auc_score = None
+
 from config import Config
 import pickle
-from torchvision import transforms
+
+# Optional dependency; only needed if you call get_transform().
+try:
+    from torchvision import transforms
+except Exception:  # pragma: no cover
+    transforms = None
+
+from pathlib import Path
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
+# Local/offline HF assets
+HF_LOCAL_DIR = Path(__file__).resolve().parent / "local_hf"
+HF_VIT_DIR = HF_LOCAL_DIR / "vit-base"
+HF_BERT_DIR = HF_LOCAL_DIR / "bert-base"
+
+def prepare_offline_models(force=False):
+    from hf_local import download_hf_models
+    download_hf_models(force=force)
+
+def _hf_path_or_id(local_path: Path, model_id: str) -> tuple[str, bool]:
+    """Return (path_or_id, local_only)."""
+    if local_path.exists() and any(local_path.iterdir()):
+        return str(local_path), True
+    return model_id, False
+
+
 class ImageEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        vit_src, local_only = _hf_path_or_id(HF_VIT_DIR, "google/vit-base-patch16-224-in21k")
+        self.vit = ViTModel.from_pretrained(vit_src, local_files_only=local_only)
 
     def forward(self, images):
         outputs = self.vit(pixel_values=images)
@@ -32,7 +61,8 @@ class ImageEncoder(nn.Module):
 class TextEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
+        bert_src, local_only = _hf_path_or_id(HF_BERT_DIR, "bert-base-uncased")
+        self.bert = BertModel.from_pretrained(bert_src, local_files_only=local_only)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(
@@ -75,27 +105,26 @@ class ClassificationHead(nn.Module):
 
 
 class CrossModalModel(nn.Module):
-    def __init__(self, *, tokenizer=None, image_processor=None):
+    def __init__(self):
         super().__init__()
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
         self.cross_attn = CrossAttention(hidden_dim=768)
         self.classifier = ClassificationHead(hidden_dim=768)
 
-        # Non-trainable helpers for preprocessing (kept out of state_dict)
-        self._tokenizer = tokenizer
-        self._image_processor = image_processor
 
     @property
     def tokenizer(self):
         if self._tokenizer is None:
-            self._tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+            bert_src, local_only = _hf_path_or_id(HF_BERT_DIR, "bert-base-uncased")
+            self._tokenizer = BertTokenizer.from_pretrained(bert_src, local_files_only=local_only)
         return self._tokenizer
 
     @property
     def image_processor(self):
         if self._image_processor is None:
-            self._image_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+            vit_src, local_only = _hf_path_or_id(HF_VIT_DIR, "google/vit-base-patch16-224-in21k")
+            self._image_processor = ViTImageProcessor.from_pretrained(vit_src, local_files_only=local_only)
         return self._image_processor
 
     def encode_text(self, text: str, *, device=None):
@@ -128,10 +157,6 @@ class CrossModalModel(nn.Module):
 
         return logits
 
-    def predict(self, image, text: str, *, threshold: float = 0.5, device=None) -> int:
-        p = self.predict_proba(image, text, device=device)
-        return int(p >= threshold)
-
     @torch.no_grad()
     def predict_proba(self, image, text: str, *, device=None) -> float:
         self.eval()
@@ -150,25 +175,43 @@ class CrossModalModel(nn.Module):
         return int(p >= threshold)
 
     def get_transform(self):
-        p = self.image_processor
+        return get_transform()
 
-        size = getattr(p, "size", None)
-        if isinstance(size, dict):
-            height = int(size.get("height", 224))
-            width = int(size.get("width", 224))
-        elif isinstance(size, (int, float)):
-            height = width = int(size)
-        else:
-            height = width = 224
 
-        mean = list(getattr(p, "image_mean", [0.5, 0.5, 0.5]))
-        std = list(getattr(p, "image_std", [0.5, 0.5, 0.5]))
+def get_transform():
+    """Standalone image transform matching the ViT preprocessing used by this project.
 
-        return transforms.Compose([
-            transforms.Resize((height, width)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ])
+    Uses the same (possibly offline-loaded) `ViTImageProcessor` config to construct a
+    torchvision transform: Resize -> ToTensor -> Normalize.
+
+    Raises:
+        ImportError: if torchvision isn't installed.
+    """
+    if transforms is None:
+        raise ImportError(
+            "torchvision is required for get_transform(). Install it or use ViTImageProcessor directly."
+        )
+
+    vit_src, local_only = _hf_path_or_id(HF_VIT_DIR, "google/vit-base-patch16-224-in21k")
+    p = ViTImageProcessor.from_pretrained(vit_src, local_files_only=local_only)
+
+    size = getattr(p, "size", None)
+    if isinstance(size, dict):
+        height = int(size.get("height", 224))
+        width = int(size.get("width", 224))
+    elif isinstance(size, (int, float)):
+        height = width = int(size)
+    else:
+        height = width = 224
+
+    mean = list(getattr(p, "image_mean", [0.5, 0.5, 0.5]))
+    std = list(getattr(p, "image_std", [0.5, 0.5, 0.5]))
+
+    return transforms.Compose([
+        transforms.Resize((height, width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
 
 
 def train_one_epoch(model, loader, optimizer, scaler):
@@ -272,8 +315,8 @@ def train():
 
         if val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
-            torch.save(model.state_dict(), "best_cross_modal_model.pt")
-            print("Saved best model")
+            torch.save(model.state_dict(), "weights.pth")
+            print("Saved best model (weights.pth)")
 
     print("Training complete. Best AUC:", best_auc)
 

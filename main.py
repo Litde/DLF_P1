@@ -6,7 +6,7 @@ from collections import defaultdict
 import torch
 from PIL import Image
 
-from train import CrossModalModel
+from train import CrossModalModel, ImageEncoder, TextEncoder, CrossAttention, ClassificationHead
 
 
 def load_captions_txt(path: str) -> dict[str, list[str]]:
@@ -47,7 +47,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load model
-    state_dict = torch.load("best_cross_modal_model.pt", map_location=device)
+    state_dict = torch.load("main_model.pt", map_location=device)
     model = CrossModalModel().to(device)
     model.load_state_dict(state_dict)
 
@@ -87,6 +87,16 @@ def main():
     print(f"  match_probability(sigmoid): {prob:.4f}")
     print(f"  predicted_label(threshold=0.5): {pred}")
 
+def tmp_save():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load model
+    state_dict = torch.load("main_model.pt", map_location=device)
+    model = CrossModalModel().to(device)
+    model.load_state_dict(state_dict)
+
+    torch.save(model.state_dict(), "weights.pth")
+
 
 if __name__ == "__main__":
-    main()
+    tmp_save()
