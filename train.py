@@ -9,12 +9,12 @@ import torch.cuda.amp as amp
 
 from transformers import BertModel
 from transformers import ViTModel
-
+from transformers import BertTokenizer, ViTImageProcessor
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-
 from config import Config
-from prepare_dataset import CrossModalDataset
 import pickle
+from torchvision import transforms
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -75,12 +75,47 @@ class ClassificationHead(nn.Module):
 
 
 class CrossModalModel(nn.Module):
-    def __init__(self):
+    def __init__(self, *, tokenizer=None, image_processor=None):
         super().__init__()
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
         self.cross_attn = CrossAttention(hidden_dim=768)
         self.classifier = ClassificationHead(hidden_dim=768)
+
+        # Non-trainable helpers for preprocessing (kept out of state_dict)
+        self._tokenizer = tokenizer
+        self._image_processor = image_processor
+
+    @property
+    def tokenizer(self):
+        if self._tokenizer is None:
+            self._tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        return self._tokenizer
+
+    @property
+    def image_processor(self):
+        if self._image_processor is None:
+            self._image_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+        return self._image_processor
+
+    def encode_text(self, text: str, *, device=None):
+        enc = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=Config.max_text_len,
+            return_tensors="pt",
+        )
+        if device is not None:
+            enc = {k: v.to(device) for k, v in enc.items()}
+        return enc
+
+    def encode_image(self, image, *, device=None):
+        # image: PIL.Image or numpy array; ViTImageProcessor supports both.
+        out = self.image_processor(image.convert("RGB"), return_tensors="pt")["pixel_values"]
+        if device is not None:
+            out = out.to(device)
+        return out
 
     def forward(self, images, input_ids, attention_mask):
         img_feats = self.image_encoder(images)
@@ -92,6 +127,48 @@ class CrossModalModel(nn.Module):
         logits = self.classifier(cls_token)
 
         return logits
+
+    def predict(self, image, text: str, *, threshold: float = 0.5, device=None) -> int:
+        p = self.predict_proba(image, text, device=device)
+        return int(p >= threshold)
+
+    @torch.no_grad()
+    def predict_proba(self, image, text: str, *, device=None) -> float:
+        self.eval()
+        if device is None:
+            device = next(self.parameters()).device
+
+        pixel_values = self.encode_image(image, device=device)
+        enc = self.encode_text(text, device=device)
+
+        logits = self(pixel_values, enc["input_ids"], enc["attention_mask"])
+        return float(torch.sigmoid(logits).item())
+
+    @torch.no_grad()
+    def predict(self, image, text: str, *, threshold: float = 0.5, device=None) -> int:
+        p = self.predict_proba(image, text, device=device)
+        return int(p >= threshold)
+
+    def get_transform(self):
+        p = self.image_processor
+
+        size = getattr(p, "size", None)
+        if isinstance(size, dict):
+            height = int(size.get("height", 224))
+            width = int(size.get("width", 224))
+        elif isinstance(size, (int, float)):
+            height = width = int(size)
+        else:
+            height = width = 224
+
+        mean = list(getattr(p, "image_mean", [0.5, 0.5, 0.5]))
+        std = list(getattr(p, "image_std", [0.5, 0.5, 0.5]))
+
+        return transforms.Compose([
+            transforms.Resize((height, width)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
 
 
 def train_one_epoch(model, loader, optimizer, scaler):
@@ -123,6 +200,12 @@ def train_one_epoch(model, loader, optimizer, scaler):
 
 @torch.no_grad()
 def evaluate(model, loader):
+    if accuracy_score is None or f1_score is None or roc_auc_score is None:
+        raise ImportError(
+            "scikit-learn (and its dependencies) is required for evaluate(). "
+            "Install it or skip evaluation metrics."
+        )
+
     model.eval()
 
     preds, labels = [], []
