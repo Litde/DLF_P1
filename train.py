@@ -1,6 +1,6 @@
 import numpy as np
 from tqdm import tqdm
-
+from prepare_dataset import CrossModalDataset
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -214,35 +214,40 @@ def get_transform():
     ])
 
 
-def train_one_epoch(model, loader, optimizer, scaler):
+def train_one_epoch(model, loader, optimizer, scaler, epoch: int | None = None):
     model.train()
     losses = []
 
-    for batch in tqdm(loader):
-        optimizer.zero_grad()
+    desc = f"Training Epoch {epoch + 1}" if epoch is not None else "Training"
+    with tqdm(loader, desc=desc, unit="batch") as pbar:
+        for batch in pbar:
+            optimizer.zero_grad()
 
-        with amp.autocast():
-            logits = model(
-                batch["image"].to(device),
-                batch["input_ids"].to(device),
-                batch["attention_mask"].to(device)
-            )
+            with amp.autocast():
+                logits = model(
+                    batch["image"].to(device),
+                    batch["input_ids"].to(device),
+                    batch["attention_mask"].to(device)
+                )
 
-            loss = F.binary_cross_entropy_with_logits(
-                logits,
-                batch["label"].to(device)
-            )
+                loss = F.binary_cross_entropy_with_logits(
+                    logits,
+                    batch["label"].to(device)
+                )
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        losses.append(loss.item())
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            losses.append(loss.item())
 
-    return np.mean(losses)
+            # update progress bar with current loss
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    return float(np.mean(losses))
 
 
 @torch.no_grad()
-def evaluate(model, loader):
+def evaluate(model, loader, epoch: int | None = None):
     if accuracy_score is None or f1_score is None or roc_auc_score is None:
         raise ImportError(
             "scikit-learn (and its dependencies) is required for evaluate(). "
@@ -252,8 +257,8 @@ def evaluate(model, loader):
     model.eval()
 
     preds, labels = [], []
-
-    for batch in tqdm(loader, desc="Evaluating"):
+    desc = f"Evaluating Epoch {epoch + 1}" if epoch is not None else "Evaluating"
+    for batch in tqdm(loader, desc=desc, unit="batch"):
         logits = model(
             batch["image"].to(device),
             batch["input_ids"].to(device),
@@ -276,7 +281,7 @@ def evaluate(model, loader):
 
 def train():
     print("Loading dataset from dataset.pkl...")
-    with open("dataset.pkl", "rb") as f:
+    with open("named_datasetV2.pkl", "rb") as f:
         dataset = pickle.load(f)
     print(f"Loaded dataset with {len(dataset)} samples.")
 
@@ -304,13 +309,13 @@ def train():
     best_auc = 0.0
     print(f"Starting training for {Config.num_epochs} epochs...")
 
-    for epoch in tqdm(range(Config.num_epochs), desc="Training Epochs"):
+    for epoch in tqdm(range(Config.num_epochs), desc="Epochs", unit="epoch"):
         print(f"\nEpoch {epoch + 1}/{Config.num_epochs}")
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler)
+        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, epoch)
         print(f"Train Loss: {train_loss:.4f}")
 
-        val_metrics = evaluate(model, val_loader)
+        val_metrics = evaluate(model, val_loader, epoch)
         print(f"Val Accuracy: {val_metrics['accuracy']:.4f}, F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
 
         if val_metrics['auc'] > best_auc:
