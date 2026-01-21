@@ -1,6 +1,6 @@
 import numpy as np
 from tqdm import tqdm
-from prepare_dataset import CrossModalDataset
+from prepare_dataset import CrossModalDataset, create_and_save_dataset_v2, save_dataset
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
     transforms = None
 
 from pathlib import Path
+import os
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -111,6 +112,9 @@ class CrossModalModel(nn.Module):
         self.text_encoder = TextEncoder()
         self.cross_attn = CrossAttention(hidden_dim=768)
         self.classifier = ClassificationHead(hidden_dim=768)
+        # ensure these exist to avoid attribute errors when accessing properties
+        self._tokenizer = None
+        self._image_processor = None
 
 
     @property
@@ -219,7 +223,8 @@ def train_one_epoch(model, loader, optimizer, scaler, epoch: int | None = None):
     losses = []
 
     desc = f"Training Epoch {epoch + 1}" if epoch is not None else "Training"
-    with tqdm(loader, desc=desc, unit="batch") as pbar:
+    # use leave=False so nested bars don't accumulate
+    with tqdm(loader, desc=desc, unit="batch", leave=False) as pbar:
         for batch in pbar:
             optimizer.zero_grad()
 
@@ -258,7 +263,7 @@ def evaluate(model, loader, epoch: int | None = None):
 
     preds, labels = [], []
     desc = f"Evaluating Epoch {epoch + 1}" if epoch is not None else "Evaluating"
-    for batch in tqdm(loader, desc=desc, unit="batch"):
+    for batch in tqdm(loader, desc=desc, unit="batch", leave=False):
         logits = model(
             batch["image"].to(device),
             batch["input_ids"].to(device),
@@ -278,9 +283,49 @@ def evaluate(model, loader, epoch: int | None = None):
     }
 
 
+# --- new helpers: dataset creation + freezing transformers ---
+
+def create_and_save_dataset_if_missing(out_filepath: str = "named_datasetV2.pkl", force: bool = False):
+    """Create and save the dataset using prepare_dataset helpers if the file is missing or force=True.
+
+    Returns the path to the saved dataset file.
+    """
+    out_path = Path(out_filepath)
+    if out_path.exists() and not force:
+        print(f"Dataset already exists at `{out_filepath}`. Use force=True to recreate.")
+        return str(out_path)
+
+    print("Creating dataset (this may take a while)...")
+    # prepare_dataset.create_and_save_dataset_v2 already uses tqdm internally.
+    dataset, samples, saved = create_and_save_dataset_v2(out_filepath=out_filepath)
+    print(f"Saved {len(samples)} samples to `{saved}`")
+    return saved
+
+
+def freeze_transformers(model: CrossModalModel, freeze_image: bool = True, freeze_text: bool = True, set_eval: bool = True):
+    """Freeze transformer parameters so they are not trained.
+
+    This sets requires_grad=False for parameters in image/text encoders and optionally sets them to eval().
+    """
+    if freeze_image and hasattr(model, "image_encoder"):
+        for p in model.image_encoder.parameters():
+            p.requires_grad = False
+        if set_eval:
+            model.image_encoder.eval()
+
+    if freeze_text and hasattr(model, "text_encoder"):
+        for p in model.text_encoder.parameters():
+            p.requires_grad = False
+        if set_eval:
+            model.text_encoder.eval()
+
 
 def train():
     print("Loading dataset from dataset.pkl...")
+    # ensure dataset exists; if missing, create it
+    if not os.path.exists("named_datasetV2.pkl"):
+        create_and_save_dataset_if_missing("named_datasetV2.pkl")
+
     with open("named_datasetV2.pkl", "rb") as f:
         dataset = pickle.load(f)
     print(f"Loaded dataset with {len(dataset)} samples.")
@@ -298,11 +343,26 @@ def train():
 
     print("Initializing model and optimizer...")
     model = CrossModalModel().to(device)
-    optimizer = torch.optim.AdamW([
-        {"params": model.image_encoder.parameters(), "lr": Config.lr_backbone},
-        {"params": model.text_encoder.parameters(), "lr": Config.lr_backbone},
-        {"params": model.classifier.parameters(), "lr": Config.lr_head},
-    ])
+
+    # freeze pretrained transformers so they won't be trained
+    freeze_transformers(model, freeze_image=True, freeze_text=True, set_eval=True)
+
+    # collect only trainable params for optimizer (exclude frozen transformer weights)
+    param_groups = []
+    # classifier and cross-attention should be trainable
+    param_groups.append({"params": model.classifier.parameters(), "lr": Config.lr_head})
+    param_groups.append({"params": model.cross_attn.parameters(), "lr": Config.lr_head})
+
+    # include any remaining backbone/text params that are still requires_grad
+    image_backbone_params = [p for p in model.image_encoder.parameters() if p.requires_grad]
+    if image_backbone_params:
+        param_groups.append({"params": image_backbone_params, "lr": Config.lr_backbone})
+
+    text_backbone_params = [p for p in model.text_encoder.parameters() if p.requires_grad]
+    if text_backbone_params:
+        param_groups.append({"params": text_backbone_params, "lr": Config.lr_backbone})
+
+    optimizer = torch.optim.AdamW(param_groups)
     scaler = amp.GradScaler()
     print("Model, optimizer, and GradScaler initialized. Using mixed precision (float16).")
 
